@@ -42,7 +42,7 @@ from diffusion import create_mask_diffusion
 from util import (
     optimizer_to_cpu, optimizer_to_gpu, clip_grad_norm_,
     update_ema, requires_grad, cleanup, setup_distributed,
-    setup_experiment_dir, get_args
+    setup_experiment_dir, get_args, flatten_multiview_batch
 )
 from sample.pipeline_trajectory2videogen import Trajectory2VideoGenPipeline
 from evaluate.generate_short_video import generate_sample_videos
@@ -57,7 +57,8 @@ torch.backends.cudnn.allow_tf32 = True
 
 def validation(args, val_dataloader, device, vae, diffusion, model):
     total_loss = []
-    for video_data in tqdm(val_dataloader,total=len(val_dataloader)):
+    for video_data in tqdm(val_dataloader, total=len(val_dataloader), disable=dist.get_rank() != 0):
+        video_data = flatten_multiview_batch(video_data)
         mask_frame_num = args.mask_frame_num
         if not args.pre_encode:
             x = video_data['video'].to(device, non_blocking=True)
@@ -150,14 +151,16 @@ def validate_video_generation(val_dataset, args, vae, model, device, train_steps
     for frame in cated_videos:
         writer.append_data(frame)
     writer.close()
-    wandb.log({f"{wandb_name}_train_steps_{train_steps}": wandb.Video(filename, fps=4, format="mp4")})
+    if getattr(args, "use_wandb", True):
+        wandb.log({f"{wandb_name}_train_steps_{train_steps}": wandb.Video(filename, fps=4, format="mp4")})
     return 
 
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    use_wandb = bool(getattr(args, "use_wandb", True))
     if args.debug or args.do_evaluate:
         args.anno = args.anno + '-debug'
-        os.environ["WANDB_MODE"] = "offline"
+        os.environ["WANDB_MODE"] = "offline" if use_wandb else "disabled"
         args.log_every = 20
         args.val_every = 20
 
@@ -300,10 +303,23 @@ def main(args):
     if args.evaluate_checkpoint:
         train_steps = int(args.evaluate_checkpoint.split("/")[-1].split('.')[0])
     accumulation_steps = args.gradient_accumulation_steps
-    accumulated_steps = 0  
+    accumulated_steps = 0
+    progress_bar = None
+    if rank == 0:
+        progress_bar = tqdm(
+            total=args.max_train_steps,
+            initial=min(train_steps, args.max_train_steps),
+            desc="Training",
+            dynamic_ncols=True,
+        )
     for epoch in range(first_epoch, num_train_epochs):
+        if train_steps >= args.max_train_steps:
+            break
         train_sampler.set_epoch(epoch)
         for step, video_data in enumerate(train_dataloader):
+            if train_steps >= args.max_train_steps:
+                break
+            video_data = flatten_multiview_batch(video_data)
             mask_frame_num = args.mask_frame_num
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -353,6 +369,8 @@ def main(args):
                 accumulated_steps = 0 
                 train_steps += 1
                 log_steps += 1
+                if progress_bar is not None:
+                    progress_bar.update(1)
 
                 if train_steps % args.log_every == 0:
                     # Measure training speed:
@@ -369,7 +387,15 @@ def main(args):
 
 
                     logger.info(f"(step={train_steps:07d}/epoch={epoch:04d}) Train Loss: {avg_loss:.4f}, Gradient Norm: {gradient_norm:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                    if rank == 0:
+                    if progress_bar is not None:
+                        progress_bar.set_postfix(
+                            epoch=f"{epoch:04d}",
+                            loss=f"{avg_loss:.4f}",
+                            grad=f"{gradient_norm:.4f}",
+                            sps=f"{steps_per_sec:.2f}",
+                            refresh=False,
+                        )
+                    if rank == 0 and use_wandb:
                         wandb.log({'Train Loss': avg_loss}, train_steps)
                         wandb.log({'Gradient Norm': gradient_norm}, train_steps)
                     # Reset monitoring variables:
@@ -385,7 +411,8 @@ def main(args):
                         dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                         avg_loss = avg_loss.item() / dist.get_world_size()
                         if rank == 0:
-                            wandb.log({'All Reduce Val Loss': avg_loss}, train_steps)
+                            if use_wandb:
+                                wandb.log({'All Reduce Val Loss': avg_loss}, train_steps)
                             validate_video_generation(val_dataset, args, vae, ema, device, train_steps, videos_dir, wandb_name)
                     dist.barrier()
 
@@ -411,6 +438,8 @@ def main(args):
             
 
     model.eval()
+    if progress_bar is not None:
+        progress_bar.close()
 
     logger.info("Done!")
     cleanup()

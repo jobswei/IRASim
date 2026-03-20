@@ -250,12 +250,7 @@ class IRASim(nn.Module):
                 self.embed_arm_state = torch.nn.Linear(self.state_dim, 4*hidden_size)
                 self.embed_state = torch.nn.Linear(4* hidden_size, hidden_size)
                 self.mask_emb_fn = nn.Embedding(num_embeddings=1, embedding_dim=hidden_size)
-            elif args.dataset == 'rt1': # or args.dataset == 'bridge':
-                self.state_dim = 7
-                approx_gelu = lambda: nn.GELU(approximate="tanh")
-                self.embed_state = Mlp(in_features=self.state_dim, hidden_features = hidden_size*4, out_features=hidden_size, act_layer=approx_gelu, drop=0)
-                self.mask_emb_fn = nn.Embedding(num_embeddings=1, embedding_dim=hidden_size)
-            elif args.dataset == 'bridge':
+            elif args.dataset in {'rt1', 'bridge', 'libero'}:
                 self.state_dim = 7
                 approx_gelu = lambda: nn.GELU(approximate="tanh")
                 self.embed_state = Mlp(in_features=self.state_dim, hidden_features = hidden_size*4, out_features=hidden_size, act_layer=approx_gelu, drop=0)
@@ -372,9 +367,7 @@ class IRASim(nn.Module):
                 arm_state = actions
                 state_embeddings = self.embed_arm_state(arm_state) 
                 state_embeddings = self.embed_state(state_embeddings)
-            elif self.args.dataset == 'rt1' :# or self.args.dataset == 'bridge':
-                state_embeddings = self.embed_state(actions)
-            elif self.args.dataset == 'bridge':
+            elif self.args.dataset in {'rt1', 'bridge', 'libero'}:
                 state_embeddings = self.embed_state(actions)
 
             mask_emb = self.mask_emb_fn(torch.tensor(0, device=state_embeddings.device))

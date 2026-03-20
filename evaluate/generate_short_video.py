@@ -30,6 +30,7 @@ from diffusers.schedulers import (DDIMScheduler, DDPMScheduler, PNDMScheduler,
                                   EulerDiscreteScheduler, DPMSolverMultistepScheduler, 
                                   HeunDiscreteScheduler, EulerAncestralDiscreteScheduler,
                                   DEISMultistepScheduler, KDPM2AncestralDiscreteScheduler)
+from util import flatten_multiview_batch
 
 
 
@@ -67,6 +68,7 @@ def generate_sample_videos(args, val_dataloader, device, vae, ema, video_base_di
     os.makedirs(frame_base_dir,exist_ok=True)
     os.makedirs(latent_video_base_dir,exist_ok=True)
     for batch in tqdm(val_dataloader,total=len(val_dataloader),desc='predicting validation videos'):
+        batch = flatten_multiview_batch(batch)
         if args.model == 'VDM':
             x = batch['video'] 
         elif not args.pre_encode:

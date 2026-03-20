@@ -106,6 +106,44 @@ def get_args(args):
     update_paths(args)
     return args
 
+
+def _flatten_metadata_field(value):
+    if isinstance(value, (list, tuple)):
+        flattened = []
+        for item in value:
+            if isinstance(item, (list, tuple)):
+                flattened.extend(_flatten_metadata_field(item))
+            else:
+                flattened.append(item)
+        return flattened
+    return [value]
+
+
+def flatten_multiview_batch(batch):
+    tensor_dim_with_view = {
+        "video": 6,
+        "latent": 6,
+        "action": 4,
+    }
+    has_multiview = any(
+        key in batch and torch.is_tensor(batch[key]) and batch[key].dim() == expected_dim
+        for key, expected_dim in tensor_dim_with_view.items()
+    )
+    if not has_multiview:
+        return batch
+
+    flat_batch = dict(batch)
+    for key, expected_dim in tensor_dim_with_view.items():
+        if key in flat_batch and torch.is_tensor(flat_batch[key]) and flat_batch[key].dim() == expected_dim:
+            flat_batch[key] = flat_batch[key].flatten(0, 1)
+
+    if "video_name" in flat_batch and isinstance(flat_batch["video_name"], dict):
+        flat_batch["video_name"] = {
+            key: _flatten_metadata_field(value)
+            for key, value in flat_batch["video_name"].items()
+        }
+    return flat_batch
+
 #################################################################################
 #                             Training Clip Gradients                           #
 #################################################################################
@@ -204,6 +242,7 @@ def clip_grad_norm_(
     return total_norm
 
 def setup_experiment_dir(rank, args):
+    use_wandb = bool(getattr(args, "use_wandb", True))
     os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
     current_date = datetime.now()
     experiment_dir = f"{args.results_dir}/{current_date.strftime('%m')}/{current_date.strftime('%d')}/{args.anno}"
@@ -225,8 +264,9 @@ def setup_experiment_dir(rank, args):
     # Setup an experiment folder:
     wandb_name = '_'.join(experiment_dir.split('/')[-3:])
     if rank == 0 or args.debug:
-        wandb.login(key='') # TODO setup your own wandb key 
-        wandb.init(project=args.dataset, entity="", name = wandb_name)
+        if use_wandb:
+            wandb.login(key='') # TODO setup your own wandb key
+            wandb.init(project=args.dataset, entity="", name=wandb_name)
         if 'debug' in checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
             os.makedirs(videos_dir, exist_ok=True)
@@ -259,7 +299,7 @@ def create_logger(logging_dir,args):
         log_name = f'log_{args.mode}_{train_steps}.txt'
     else:
         log_name = f'log.txt'
-    if dist.get_rank() == 0 and os.environ["WORLD_SIZE"] != '1':  # real logger
+    if dist.get_rank() == 0:  # real logger for both single-GPU and multi-GPU runs
         logging.basicConfig(
             level=logging.INFO,
             # format='[\033[34m%(asctime)s\033[0m] %(message)s',
@@ -360,5 +400,3 @@ def setup_distributed(backend="nccl", port=None):
 
 
     
-
-
