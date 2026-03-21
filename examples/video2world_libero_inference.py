@@ -383,7 +383,7 @@ def to_numpy_video(video):
 def save_sample_prediction(sample_dir, sample_name, view_results, fps):
     sample_dir.mkdir(parents=True, exist_ok=True)
 
-    comparison_rows = []
+    comparison_columns = []
     sorted_view_names = sorted(
         view_results.keys(),
         key=lambda name: int(view_results[name]["metadata"]["cam_id"])
@@ -396,11 +396,11 @@ def save_sample_prediction(sample_dir, sample_name, view_results, fps):
         pred_array = view_data["pred_array"]
         np.save(sample_dir / f"{view_name}.gt.npy", gt_array)
         np.save(sample_dir / f"{view_name}.pred.npy", pred_array)
-        comparison_rows.append(np.concatenate([gt_array, pred_array], axis=2))
+        comparison_columns.append(np.concatenate([gt_array, pred_array], axis=1))
 
-    comparison_array = comparison_rows[0]
-    if len(comparison_rows) > 1:
-        comparison_array = np.concatenate(comparison_rows, axis=1)
+    comparison_array = comparison_columns[0]
+    if len(comparison_columns) > 1:
+        comparison_array = np.concatenate(comparison_columns, axis=2)
     write_video(sample_dir / "comparison.mp4", comparison_array, fps=fps)
 
     print(f"Saved {sample_name} to {sample_dir}")
