@@ -347,10 +347,20 @@ def write_video(video_path, video_array, fps):
     writer.close()
 
 
-def get_view_dirname(video_name):
-    cam_name = str(video_name.get("cam_name", video_name["cam_id"]))
-    cam_name = cam_name.replace("/", "_").replace(" ", "_")
-    return f"cam{video_name['cam_id']}_{cam_name}"
+def split_episode_id(episode_id):
+    task_name, episode_num = str(episode_id).rsplit("_", 1)
+    return task_name, episode_num
+
+
+def sanitize_name(name):
+    return str(name).replace("/", "_").replace(" ", "_")
+
+
+def build_sample_paths(output_dir, video_name):
+    task_name, episode_num = split_episode_id(video_name["episode_id"])
+    task_dir = output_dir / sanitize_name(task_name)
+    sample_dir = task_dir / f"{episode_num}_{video_name['start_frame_id']}"
+    return task_dir, sample_dir
 
 
 def trim_saved_outputs(pred_video, gt_video, pred_latents, conditioning_frames):
@@ -366,20 +376,32 @@ def trim_saved_outputs(pred_video, gt_video, pred_latents, conditioning_frames):
     return pred_video, gt_video, pred_latents
 
 
-def save_prediction(sample_dir, sample_name, pred_video, gt_video, pred_latents, metadata, fps):
-    pred_uint8 = to_uint8_video(pred_video[0])
-    gt_uint8 = to_uint8_video(gt_video[0])
-    pred_array = pred_uint8.permute(0, 2, 3, 1).contiguous().numpy()
-    gt_array = gt_uint8.permute(0, 2, 3, 1).contiguous().numpy()
-    comparison_array = torch.cat([gt_uint8, pred_uint8], dim=-1).permute(0, 2, 3, 1).contiguous().numpy()
+def to_numpy_video(video):
+    return to_uint8_video(video[0]).permute(0, 2, 3, 1).contiguous().numpy()
 
-    write_video(sample_dir / "pred.mp4", pred_array, fps=fps)
-    write_video(sample_dir / "gt.mp4", gt_array, fps=fps)
+
+def save_sample_prediction(sample_dir, sample_name, view_results, fps):
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    comparison_rows = []
+    sorted_view_names = sorted(
+        view_results.keys(),
+        key=lambda name: int(view_results[name]["metadata"]["cam_id"])
+        if str(view_results[name]["metadata"]["cam_id"]).isdigit()
+        else str(view_results[name]["metadata"]["cam_id"]),
+    )
+    for view_name in sorted_view_names:
+        view_data = view_results[view_name]
+        gt_array = view_data["gt_array"]
+        pred_array = view_data["pred_array"]
+        np.save(sample_dir / f"{view_name}.gt.npy", gt_array)
+        np.save(sample_dir / f"{view_name}.pred.npy", pred_array)
+        comparison_rows.append(np.concatenate([gt_array, pred_array], axis=2))
+
+    comparison_array = comparison_rows[0]
+    if len(comparison_rows) > 1:
+        comparison_array = np.concatenate(comparison_rows, axis=1)
     write_video(sample_dir / "comparison.mp4", comparison_array, fps=fps)
-    torch.save(pred_latents[0].cpu(), sample_dir / "pred_latents.pt")
-
-    with open(sample_dir / "metadata.json", "w", encoding="utf-8") as file:
-        json.dump(metadata, file, indent=2)
 
     print(f"Saved {sample_name} to {sample_dir}")
 
@@ -422,23 +444,16 @@ def run_slice_inference(
                 continue
 
             sample_video_name = views[0]["video_name"]
-            sample_name = (
-                f"{dataset_index:06d}_"
-                f"{sample_video_name['episode_id']}_"
-                f"start{sample_video_name['start_frame_id']}"
-            )
-            sample_dir = output_dir / sample_name
-            sample_dir.mkdir(parents=True, exist_ok=True)
+            _, sample_dir = build_sample_paths(output_dir, sample_video_name)
+            sample_name = f"{sample_video_name['episode_id']}/{sample_dir.name}"
+            comparison_path = sample_dir / "comparison.mp4"
+            if comparison_path.exists() and not cli_args.overwrite:
+                print(f"Skip existing sample {sample_name}")
+                continue
 
+            view_results = {}
             for view in views:
                 video_name = view["video_name"]
-                view_dir = sample_dir / get_view_dirname(video_name)
-                pred_video_path = view_dir / "pred.mp4"
-                if pred_video_path.exists() and not cli_args.overwrite:
-                    print(f"Skip existing sample {sample_name}/{view_dir.name}")
-                    continue
-
-                view_dir.mkdir(parents=True, exist_ok=True)
                 gt_video = view["video"].unsqueeze(0)
                 actions = view["action"].unsqueeze(0).to(device=device, dtype=torch.float32)
                 latent_video = encode_video(
@@ -471,10 +486,13 @@ def run_slice_inference(
                     current_conditioning_frames,
                 )
 
+                view_name = sanitize_name(video_name.get("cam_name", video_name["cam_id"]))
                 metadata = {
                     "inference_mode": "slice",
+                    "task_name": split_episode_id(video_name["episode_id"])[0],
+                    "episode_num": split_episode_id(video_name["episode_id"])[1],
                     "sample_name": sample_name,
-                    "view_name": view_dir.name,
+                    "view_name": view_name,
                     "dataset_index": dataset_index,
                     "episode_id": video_name["episode_id"],
                     "start_frame_id": video_name["start_frame_id"],
@@ -491,13 +509,17 @@ def run_slice_inference(
                     "decode_chunk_size": int(cli_args.decode_chunk_size),
                     "saved_pred_frames": int(saved_pred_videos.shape[1]),
                 }
-                save_prediction(
-                    sample_dir=view_dir,
-                    sample_name=f"{sample_name}/{view_dir.name}",
-                    pred_video=saved_pred_videos,
-                    gt_video=saved_gt_video,
-                    pred_latents=saved_pred_latents,
-                    metadata=metadata,
+                view_results[view_name] = {
+                    "gt_array": to_numpy_video(saved_gt_video),
+                    "pred_array": to_numpy_video(saved_pred_videos),
+                    "metadata": metadata,
+                }
+
+            if view_results:
+                save_sample_prediction(
+                    sample_dir=sample_dir,
+                    sample_name=sample_name,
+                    view_results=view_results,
                     fps=cli_args.fps,
                 )
 
@@ -544,19 +566,16 @@ def run_episode_inference(
                 continue
 
             sample_video_name = views[0]["video_name"]
-            sample_name = f"{episode_index:06d}_{sample_video_name['episode_id']}"
-            sample_dir = output_dir / sample_name
-            sample_dir.mkdir(parents=True, exist_ok=True)
+            _, sample_dir = build_sample_paths(output_dir, sample_video_name)
+            sample_name = f"{sample_video_name['episode_id']}/{sample_dir.name}"
+            comparison_path = sample_dir / "comparison.mp4"
+            if comparison_path.exists() and not cli_args.overwrite:
+                print(f"Skip existing sample {sample_name}")
+                continue
 
+            view_results = {}
             for view in views:
                 video_name = view["video_name"]
-                view_dir = sample_dir / get_view_dirname(video_name)
-                pred_video_path = view_dir / "pred.mp4"
-                if pred_video_path.exists() and not cli_args.overwrite:
-                    print(f"Skip existing sample {sample_name}/{view_dir.name}")
-                    continue
-
-                view_dir.mkdir(parents=True, exist_ok=True)
                 gt_video = view["video"].unsqueeze(0)
                 full_actions = view["action"]
                 total_frames = gt_video.shape[1]
@@ -634,7 +653,7 @@ def run_episode_inference(
                 pred_latents = torch.cat(pred_latent_segments, dim=1)
                 if pred_video.shape[1] != total_frames:
                     raise RuntimeError(
-                        f"Episode stitching failed for {sample_name}/{view_dir.name}: "
+                        f"Episode stitching failed for {sample_name}/{video_name.get('cam_name', video_name['cam_id'])}: "
                         f"pred_frames={pred_video.shape[1]}, gt_frames={total_frames}."
                     )
 
@@ -645,10 +664,13 @@ def run_episode_inference(
                     current_conditioning_frames,
                 )
 
+                view_name = sanitize_name(video_name.get("cam_name", video_name["cam_id"]))
                 metadata = {
                     "inference_mode": "episode",
+                    "task_name": split_episode_id(video_name["episode_id"])[0],
+                    "episode_num": split_episode_id(video_name["episode_id"])[1],
                     "sample_name": sample_name,
-                    "view_name": view_dir.name,
+                    "view_name": view_name,
                     "episode_index": int(episode_index),
                     "episode_id": video_name["episode_id"],
                     "start_frame_id": video_name["start_frame_id"],
@@ -668,13 +690,17 @@ def run_episode_inference(
                     "segment_ranges": segment_ranges,
                     "saved_pred_frames": int(saved_pred_video.shape[1]),
                 }
-                save_prediction(
-                    sample_dir=view_dir,
-                    sample_name=f"{sample_name}/{view_dir.name}",
-                    pred_video=saved_pred_video,
-                    gt_video=saved_gt_video,
-                    pred_latents=saved_pred_latents,
-                    metadata=metadata,
+                view_results[view_name] = {
+                    "gt_array": to_numpy_video(saved_gt_video),
+                    "pred_array": to_numpy_video(saved_pred_video),
+                    "metadata": metadata,
+                }
+
+            if view_results:
+                save_sample_prediction(
+                    sample_dir=sample_dir,
+                    sample_name=sample_name,
+                    view_results=view_results,
                     fps=cli_args.fps,
                 )
 
