@@ -255,6 +255,7 @@ class Trajectory2VideoGenPipeline(DiffusionPipeline):
         # clean_caption: bool = True,
         # mask_feature: bool = True,、
         enable_vae_temporal_decoder: bool = False,
+        decode_chunk_size: int = 1,
         device = None
     ) -> Union[VideoPipelineOutput, Tuple]:
         """
@@ -459,7 +460,7 @@ class Trajectory2VideoGenPipeline(DiffusionPipeline):
         # from utils import show_latents
         videos = None
         if output_type == 'both':
-            videos = self.decode_latents(latents)
+            videos = self.decode_latents(latents, decode_chunk_size=decode_chunk_size)
         elif output_type == 'video':
             videos = latents
             latents = None
@@ -468,14 +469,16 @@ class Trajectory2VideoGenPipeline(DiffusionPipeline):
         self.maybe_free_model_hooks()
         return videos, latents
     
-    def decode_latents(self, latents):
+    def decode_latents(self, latents, decode_chunk_size=1):
         video_length = latents.shape[1]
         latents = latents / self.vae.config.scaling_factor
         latents = einops.rearrange(latents, "b f c h w -> (b f) c h w")
+        decode_chunk_size = max(int(decode_chunk_size), 1)
         video = []
-        for frame_idx in range(latents.shape[0]):
-            video.append(self.vae.decode(
-                latents[frame_idx:frame_idx+1]).sample)
+        for frame_idx in range(0, latents.shape[0], decode_chunk_size):
+            video.append(
+                self.vae.decode(latents[frame_idx:frame_idx + decode_chunk_size]).sample
+            )
         video = torch.cat(video)
         video = einops.rearrange(video, "(b f) c h w -> b f c h w", f=video_length)
         # video = ((video / 2.0 + 0.5).clamp(0, 1) * 255).to(dtype=torch.uint8).cpu().contiguous()

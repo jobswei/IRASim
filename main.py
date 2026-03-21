@@ -128,7 +128,8 @@ def validate_video_generation(val_dataset, args, vae, model, device, train_steps
                             num_inference_steps=args.infer_num_sampling_steps,
                             guidance_scale=args.guidance_scale, # dumpy
                             device = device,
-                            output_type = 'both'
+                            output_type = 'both',
+                            decode_chunk_size=getattr(args, 'decode_chunk_size', 1),
                             )
 
     

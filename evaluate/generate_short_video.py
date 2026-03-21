@@ -59,7 +59,8 @@ def generate_single_video(args, batch_start_frame, actions, device, vae, model):
                                 guidance_scale=args.guidance_scale, # dumpy
                                 device = device,
                                 return_dict = False,
-                                output_type = 'both' if args.model != "VDM" else 'video'
+                                output_type = 'both' if args.model != "VDM" else 'video',
+                                decode_chunk_size=getattr(args, 'decode_chunk_size', 1),
                                 )
         return videos, latents
         

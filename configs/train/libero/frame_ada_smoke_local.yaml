@@ -1,0 +1,51 @@
+dataset_dir: "work_dirs/Datasets/EWM_infer_meta"
+project_dir: "./"
+vae_model_path: "work_dirs/Checkpoints/stable-diffusion-xl-base-1.0"
+scheduler_path: "pretrained_models/scheduler"
+results_dir: "work_dirs/results"
+use_wandb: False
+dataset_log_first_n: 2
+
+dataset: "libero"
+libero_split: "90"
+libero_train_annotation: "work_dirs/Datasets/EWM_infer_meta/libero/90/annotations_train_small.json"
+libero_eval_annotation: "work_dirs/Datasets/EWM_infer_meta/libero/90/annotations_eval.json"
+sequence_interval: 1
+sample_interval: 40
+sample_strategy: "uniform"
+cam_ids: ["hand", "head"]
+libero_use_all_views: True
+accumulate_action: False
+pre_encode: False
+normalize: True
+mode: "val"
+
+anno: "libero_frame_ada_smoke_local"
+debug: True
+do_evaluate: False
+final_frame_ada: False
+
+evaluate_checkpoint: False
+
+model: IRASim-S/2
+num_frames: 87
+video_size: [128, 128]
+learn_sigma: False
+extras: 3
+mask_frame_num: 7
+
+learning_rate: 1e-4
+ckpt_every: 1
+clip_max_norm: 0.1
+start_clip_iter: 0
+local_batch_size: 1
+local_val_batch_size: 1
+max_train_steps: 1
+global_seed: 3407
+num_workers: 0
+log_every: 1
+val_every: 1000
+gradient_accumulation_steps: 1
+attention_mode: "math"
+
+resume_from_checkpoint: False
