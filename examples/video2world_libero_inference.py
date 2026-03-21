@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from pathlib import Path
 
 import imageio
@@ -9,6 +10,7 @@ from diffusers.models import AutoencoderKL
 from diffusers.schedulers import DDPMScheduler, PNDMScheduler
 from einops import rearrange
 from omegaconf import OmegaConf
+from tqdm import tqdm
 
 from dataset.dataset_libero import Dataset_Libero
 from models import get_models
@@ -61,8 +63,8 @@ def parse_args():
     parser.add_argument(
         "--max-samples",
         type=int,
-        default=8,
-        help="How many episodes/slices to run. Use -1 for all remaining items.",
+        default=-1,
+        help="How many episodes/slices to run. Default -1 means all remaining items.",
     )
     parser.add_argument(
         "--conditioning-frames",
@@ -123,6 +125,9 @@ def parse_args():
         action="store_true",
         help="Overwrite existing outputs instead of skipping them.",
     )
+    parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rank", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--world-size", "--world_size", type=int, default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -136,6 +141,53 @@ def load_config(config_path):
     args.debug = False
     args.use_wandb = False
     return args
+
+
+def resolve_runtime_context(cli_args):
+    env_rank = os.environ.get("RANK")
+    env_world_size = os.environ.get("WORLD_SIZE")
+    env_local_rank = os.environ.get("LOCAL_RANK")
+
+    rank = cli_args.rank if cli_args.rank is not None else int(env_rank) if env_rank is not None else 0
+    world_size = (
+        cli_args.world_size
+        if cli_args.world_size is not None
+        else int(env_world_size)
+        if env_world_size is not None
+        else 1
+    )
+    local_rank = (
+        cli_args.local_rank
+        if cli_args.local_rank is not None
+        else int(env_local_rank)
+        if env_local_rank is not None
+        else rank
+    )
+    return rank, world_size, local_rank
+
+
+def resolve_device(device_arg, local_rank):
+    if device_arg == "cuda":
+        return torch.device(f"cuda:{local_rank}")
+    return torch.device(device_arg)
+
+
+def build_selected_indices(total_count, start_index, max_samples):
+    start_index = max(int(start_index), 0)
+    if max_samples < 0:
+        end_index = total_count
+    else:
+        end_index = min(total_count, start_index + int(max_samples))
+
+    if start_index >= end_index:
+        raise ValueError(
+            f"Empty inference range: start_index={start_index}, end_index={end_index}, total_count={total_count}."
+        )
+    return list(range(start_index, end_index))
+
+
+def shard_indices(indices, rank, world_size):
+    return indices[rank::world_size]
 
 
 def build_scheduler(args):
@@ -332,23 +384,38 @@ def save_prediction(sample_dir, sample_name, pred_video, gt_video, pred_latents,
     print(f"Saved {sample_name} to {sample_dir}")
 
 
-def run_slice_inference(dataset, pipeline, vae, device, args, cli_args, checkpoint_path, output_dir):
-    start_index = max(cli_args.start_index, 0)
-    if cli_args.max_samples < 0:
-        end_index = len(dataset)
-    else:
-        end_index = min(len(dataset), start_index + cli_args.max_samples)
-
-    if start_index >= end_index:
-        raise ValueError(
-            f"Empty inference range: start_index={start_index}, end_index={end_index}, "
-            f"dataset_size={len(dataset)}."
-        )
-
+def run_slice_inference(
+    dataset,
+    pipeline,
+    vae,
+    device,
+    args,
+    cli_args,
+    checkpoint_path,
+    output_dir,
+    rank,
+    world_size,
+):
+    selected_indices = build_selected_indices(len(dataset), cli_args.start_index, cli_args.max_samples)
+    local_indices = shard_indices(selected_indices, rank, world_size)
     conditioning_frames = max(int(cli_args.conditioning_frames), 1)
 
+    if rank == 0:
+        print(
+            f"[Inference] mode=slice total_slices={len(selected_indices)} "
+            f"dataset_size={len(dataset)} world_size={world_size}"
+        )
+    print(f"[Inference] rank={rank} assigned_slices={len(local_indices)}")
+
+    progress = tqdm(
+        local_indices,
+        total=len(local_indices),
+        desc=f"Slice Inference Rank {rank}",
+        position=rank,
+        leave=True,
+    )
     with torch.no_grad():
-        for dataset_index in range(start_index, end_index):
+        for dataset_index in progress:
             sample = dataset[dataset_index]
             views = expand_views(sample)
             if not views:
@@ -363,7 +430,7 @@ def run_slice_inference(dataset, pipeline, vae, device, args, cli_args, checkpoi
             sample_dir = output_dir / sample_name
             sample_dir.mkdir(parents=True, exist_ok=True)
 
-            for view in expand_views(sample):
+            for view in views:
                 video_name = view["video_name"]
                 view_dir = sample_dir / get_view_dirname(video_name)
                 pred_video_path = view_dir / "pred.mp4"
@@ -435,27 +502,42 @@ def run_slice_inference(dataset, pipeline, vae, device, args, cli_args, checkpoi
                 )
 
 
-def run_episode_inference(dataset, pipeline, vae, device, args, cli_args, checkpoint_path, output_dir):
+def run_episode_inference(
+    dataset,
+    pipeline,
+    vae,
+    device,
+    args,
+    cli_args,
+    checkpoint_path,
+    output_dir,
+    rank,
+    world_size,
+):
     if int(args.num_frames) <= 1:
         raise ValueError(f"`num_frames` must be > 1, got {args.num_frames}.")
 
     requested_conditioning_frames = max(int(cli_args.conditioning_frames), 1)
     requested_conditioning_frames = min(requested_conditioning_frames, int(args.num_frames) - 1)
+    selected_indices = build_selected_indices(len(dataset.annotations), cli_args.start_index, cli_args.max_samples)
+    local_indices = shard_indices(selected_indices, rank, world_size)
 
-    start_index = max(cli_args.start_index, 0)
-    if cli_args.max_samples < 0:
-        end_index = len(dataset.annotations)
-    else:
-        end_index = min(len(dataset.annotations), start_index + cli_args.max_samples)
-
-    if start_index >= end_index:
-        raise ValueError(
-            f"Empty inference range: start_index={start_index}, end_index={end_index}, "
-            f"episode_count={len(dataset.annotations)}."
+    if rank == 0:
+        print(
+            f"[Inference] mode=episode total_episodes={len(selected_indices)} "
+            f"episode_count={len(dataset.annotations)} world_size={world_size}"
         )
+    print(f"[Inference] rank={rank} assigned_episodes={len(local_indices)}")
 
+    progress = tqdm(
+        local_indices,
+        total=len(local_indices),
+        desc=f"Episode Inference Rank {rank}",
+        position=rank,
+        leave=True,
+    )
     with torch.no_grad():
-        for episode_index in range(start_index, end_index):
+        for episode_index in progress:
             ann = dataset.annotations[episode_index]
             views = resolve_episode_views(dataset, ann)
             if not views:
@@ -611,13 +693,15 @@ def main():
     if cli_args.num_inference_steps is not None:
         args.infer_num_sampling_steps = cli_args.num_inference_steps
 
-    device = torch.device(cli_args.device)
+    rank, world_size, local_rank = resolve_runtime_context(cli_args)
+    device = resolve_device(cli_args.device, local_rank)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
 
-    torch.manual_seed(cli_args.seed)
+    torch.manual_seed(cli_args.seed + rank)
     if device.type == "cuda":
-        torch.cuda.manual_seed_all(cli_args.seed)
+        torch.cuda.set_device(device)
+        torch.cuda.manual_seed_all(cli_args.seed + rank)
 
     checkpoint_path = Path(cli_args.checkpoint)
     if not checkpoint_path.exists():
@@ -655,6 +739,8 @@ def main():
             cli_args=cli_args,
             checkpoint_path=checkpoint_path,
             output_dir=output_dir,
+            rank=rank,
+            world_size=world_size,
         )
     else:
         run_slice_inference(
@@ -666,6 +752,8 @@ def main():
             cli_args=cli_args,
             checkpoint_path=checkpoint_path,
             output_dir=output_dir,
+            rank=rank,
+            world_size=world_size,
         )
 
 
