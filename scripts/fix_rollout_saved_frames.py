@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 import argparse
 import json
+import os
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import imageio
 import numpy as np
@@ -31,6 +33,15 @@ def parse_args():
         "--dry-run",
         action="store_true",
         help="Report the changes without writing files.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of worker processes. "
+            "Default 0 means auto-select based on available CPUs."
+        ),
     )
     return parser.parse_args()
 
@@ -72,6 +83,16 @@ def resolve_view_names(sample_dir, metadata):
     if metadata_views:
         return [view_name for view_name in metadata_views if (sample_dir / f"{view_name}.pred.npy").exists()]
     return pred_views
+
+
+def resolve_worker_count(requested_workers, job_count):
+    if job_count <= 0:
+        return 1
+    if requested_workers and requested_workers > 0:
+        return min(int(requested_workers), job_count)
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(cpu_count, job_count))
 
 
 def fix_sample_dir(sample_dir, fps, dry_run):
@@ -173,22 +194,56 @@ def fix_sample_dir(sample_dir, fps, dry_run):
     }
 
 
+def fix_sample_dir_worker(sample_dir_str, fps, dry_run):
+    return fix_sample_dir(Path(sample_dir_str), fps=fps, dry_run=dry_run)
+
+
 def main():
     args = parse_args()
     rollout_dirs = find_rollout_dirs(args.root)
     print(f"Found {len(rollout_dirs)} rollout directories under {args.root}")
 
+    if not rollout_dirs:
+        mode = "Would fix" if args.dry_run else "Fixed"
+        print(f"{mode} 0 rollout directories")
+        return
+
+    workers = resolve_worker_count(args.workers, len(rollout_dirs))
+    print(f"Using {workers} worker processes")
+
     changed_count = 0
-    for sample_dir in rollout_dirs:
-        result = fix_sample_dir(sample_dir, fps=args.fps, dry_run=args.dry_run)
-        if result.get("changed"):
-            changed_count += 1
-            print(
-                f"Fixed {result['sample_dir']} "
-                f"(views={result['view_count']}, "
-                f"prediction_frames={result['saved_prediction_frames']}, "
-                f"comparison_frames={result['saved_comparison_frames']})"
-            )
+    if workers == 1:
+        for sample_dir in rollout_dirs:
+            result = fix_sample_dir(sample_dir, fps=args.fps, dry_run=args.dry_run)
+            if result.get("changed"):
+                changed_count += 1
+                print(
+                    f"Fixed {result['sample_dir']} "
+                    f"(views={result['view_count']}, "
+                    f"prediction_frames={result['saved_prediction_frames']}, "
+                    f"comparison_frames={result['saved_comparison_frames']})"
+                )
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    fix_sample_dir_worker,
+                    str(sample_dir),
+                    args.fps,
+                    args.dry_run,
+                )
+                for sample_dir in rollout_dirs
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                if result.get("changed"):
+                    changed_count += 1
+                    print(
+                        f"Fixed {result['sample_dir']} "
+                        f"(views={result['view_count']}, "
+                        f"prediction_frames={result['saved_prediction_frames']}, "
+                        f"comparison_frames={result['saved_comparison_frames']})"
+                    )
 
     mode = "Would fix" if args.dry_run else "Fixed"
     print(f"{mode} {changed_count} rollout directories")
