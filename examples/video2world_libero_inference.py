@@ -862,7 +862,6 @@ def run_rollout_inference(
                     initial_conditioning_frames,
                     gt_video.shape[1],
                     int(cli_args.total_frames),
-                    available_gt_frames,
                 )
 
                 if current_initial_conditioning_frames <= 0:
