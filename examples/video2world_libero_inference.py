@@ -448,29 +448,49 @@ def save_rollout_prediction(sample_dir, sample_name, view_results, fps):
     for view_name in sorted_view_names:
         view_data = view_results[view_name]
         pred_array = view_data["pred_array"]
-        pred_columns.append(pred_array)
-        metadata["views"][view_name] = view_data["metadata"]
-        np.save(sample_dir / f"{view_name}.pred.npy", pred_array)
-        write_video(sample_dir / f"{view_name}.pred.mp4", pred_array, fps=fps)
-
         gt_array = view_data.get("gt_array")
+        saved_pred_array = pred_array
+        saved_gt_array = None
+
         if gt_array is not None and gt_array.shape[0] > 0:
             gt_frames = min(gt_array.shape[0], pred_array.shape[0])
-            trimmed_gt = gt_array[:gt_frames]
-            trimmed_pred = pred_array[:gt_frames]
-            np.save(sample_dir / f"{view_name}.gt.npy", trimmed_gt)
-            comparison_columns.append(np.concatenate([trimmed_gt, trimmed_pred], axis=1))
+            saved_gt_array = gt_array[:gt_frames]
+            saved_pred_array = pred_array[:gt_frames]
+            np.save(sample_dir / f"{view_name}.gt.npy", saved_gt_array)
+            comparison_columns.append(np.concatenate([saved_gt_array, saved_pred_array], axis=1))
 
-    pred_array = pred_columns[0]
+        pred_columns.append(saved_pred_array)
+        np.save(sample_dir / f"{view_name}.pred.npy", saved_pred_array)
+        write_video(sample_dir / f"{view_name}.pred.mp4", saved_pred_array, fps=fps)
+
+        view_metadata = dict(view_data["metadata"])
+        view_metadata["saved_pred_frames"] = int(saved_pred_array.shape[0])
+        view_metadata["saved_gt_frames"] = int(saved_gt_array.shape[0]) if saved_gt_array is not None else 0
+        view_metadata["saved_comparison_frames"] = int(saved_pred_array.shape[0]) if saved_gt_array is not None else 0
+        metadata["views"][view_name] = view_metadata
+
+    saved_prediction_frames = min(pred_array.shape[0] for pred_array in pred_columns)
+    pred_array = pred_columns[0][:saved_prediction_frames]
     if len(pred_columns) > 1:
-        pred_array = np.concatenate(pred_columns, axis=2)
+        pred_array = np.concatenate(
+            [view_pred[:saved_prediction_frames] for view_pred in pred_columns],
+            axis=2,
+        )
     write_video(sample_dir / "prediction.mp4", pred_array, fps=fps)
+    metadata["saved_prediction_frames"] = int(saved_prediction_frames)
 
     if comparison_columns:
-        comparison_array = comparison_columns[0]
+        saved_comparison_frames = min(comparison_array.shape[0] for comparison_array in comparison_columns)
+        comparison_array = comparison_columns[0][:saved_comparison_frames]
         if len(comparison_columns) > 1:
-            comparison_array = np.concatenate(comparison_columns, axis=2)
+            comparison_array = np.concatenate(
+                [comparison[:saved_comparison_frames] for comparison in comparison_columns],
+                axis=2,
+            )
         write_video(sample_dir / "comparison.mp4", comparison_array, fps=fps)
+        metadata["saved_comparison_frames"] = int(saved_comparison_frames)
+    else:
+        metadata["saved_comparison_frames"] = 0
 
     with open(sample_dir / "metadata.json", "w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2)
