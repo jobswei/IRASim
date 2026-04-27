@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -42,6 +43,12 @@ def parse_args():
             "Number of worker processes. "
             "Default 0 means auto-select based on available CPUs."
         ),
+    )
+    parser.add_argument(
+        "--min-frames",
+        type=int,
+        default=10,
+        help="Delete rollout directories whose saved prediction length is smaller than this value.",
     )
     return parser.parse_args()
 
@@ -95,7 +102,7 @@ def resolve_worker_count(requested_workers, job_count):
     return max(1, min(cpu_count, job_count))
 
 
-def fix_sample_dir(sample_dir, fps, dry_run):
+def fix_sample_dir(sample_dir, fps, dry_run, min_frames):
     metadata = load_metadata(sample_dir)
     view_names = resolve_view_names(sample_dir, metadata)
     if not view_names:
@@ -181,12 +188,27 @@ def fix_sample_dir(sample_dir, fps, dry_run):
 
     metadata["saved_prediction_frames"] = int(saved_prediction_frames)
     metadata["saved_comparison_frames"] = int(saved_comparison_frames)
+
+    should_delete = saved_prediction_frames < int(min_frames)
+    if should_delete:
+        if not dry_run:
+            shutil.rmtree(sample_dir)
+        return {
+            "changed": True,
+            "deleted": True,
+            "sample_dir": str(sample_dir),
+            "saved_prediction_frames": int(saved_prediction_frames),
+            "saved_comparison_frames": int(saved_comparison_frames),
+            "view_count": len(view_names),
+        }
+
     if not dry_run:
         with open(sample_dir / "metadata.json", "w", encoding="utf-8") as file:
             json.dump(metadata, file, indent=2)
 
     return {
         "changed": changed,
+        "deleted": False,
         "sample_dir": str(sample_dir),
         "saved_prediction_frames": int(saved_prediction_frames),
         "saved_comparison_frames": int(saved_comparison_frames),
@@ -194,8 +216,8 @@ def fix_sample_dir(sample_dir, fps, dry_run):
     }
 
 
-def fix_sample_dir_worker(sample_dir_str, fps, dry_run):
-    return fix_sample_dir(Path(sample_dir_str), fps=fps, dry_run=dry_run)
+def fix_sample_dir_worker(sample_dir_str, fps, dry_run, min_frames):
+    return fix_sample_dir(Path(sample_dir_str), fps=fps, dry_run=dry_run, min_frames=min_frames)
 
 
 def main():
@@ -212,17 +234,31 @@ def main():
     print(f"Using {workers} worker processes")
 
     changed_count = 0
+    deleted_count = 0
     if workers == 1:
         for sample_dir in rollout_dirs:
-            result = fix_sample_dir(sample_dir, fps=args.fps, dry_run=args.dry_run)
+            result = fix_sample_dir(
+                sample_dir,
+                fps=args.fps,
+                dry_run=args.dry_run,
+                min_frames=args.min_frames,
+            )
             if result.get("changed"):
                 changed_count += 1
-                print(
-                    f"Fixed {result['sample_dir']} "
-                    f"(views={result['view_count']}, "
-                    f"prediction_frames={result['saved_prediction_frames']}, "
-                    f"comparison_frames={result['saved_comparison_frames']})"
-                )
+                if result.get("deleted"):
+                    deleted_count += 1
+                    print(
+                        f"Deleted {result['sample_dir']} "
+                        f"(views={result['view_count']}, "
+                        f"prediction_frames={result['saved_prediction_frames']})"
+                    )
+                else:
+                    print(
+                        f"Fixed {result['sample_dir']} "
+                        f"(views={result['view_count']}, "
+                        f"prediction_frames={result['saved_prediction_frames']}, "
+                        f"comparison_frames={result['saved_comparison_frames']})"
+                    )
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = [
@@ -231,6 +267,7 @@ def main():
                     str(sample_dir),
                     args.fps,
                     args.dry_run,
+                    args.min_frames,
                 )
                 for sample_dir in rollout_dirs
             ]
@@ -238,15 +275,24 @@ def main():
                 result = future.result()
                 if result.get("changed"):
                     changed_count += 1
-                    print(
-                        f"Fixed {result['sample_dir']} "
-                        f"(views={result['view_count']}, "
-                        f"prediction_frames={result['saved_prediction_frames']}, "
-                        f"comparison_frames={result['saved_comparison_frames']})"
-                    )
+                    if result.get("deleted"):
+                        deleted_count += 1
+                        print(
+                            f"Deleted {result['sample_dir']} "
+                            f"(views={result['view_count']}, "
+                            f"prediction_frames={result['saved_prediction_frames']})"
+                        )
+                    else:
+                        print(
+                            f"Fixed {result['sample_dir']} "
+                            f"(views={result['view_count']}, "
+                            f"prediction_frames={result['saved_prediction_frames']}, "
+                            f"comparison_frames={result['saved_comparison_frames']})"
+                        )
 
     mode = "Would fix" if args.dry_run else "Fixed"
-    print(f"{mode} {changed_count} rollout directories")
+    delete_mode = "would delete" if args.dry_run else "deleted"
+    print(f"{mode} {changed_count} rollout directories; {delete_mode} {deleted_count} short rollouts")
 
 
 if __name__ == "__main__":
