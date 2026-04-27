@@ -41,10 +41,12 @@ def parse_args():
         "--inference-mode",
         type=str,
         default="slice",
-        choices=["episode", "slice"],
+        choices=["episode", "rollout", "slice"],
         help=(
             "`slice` runs fixed-window dataset-slice inference. "
-            "`episode` runs autoregressive chunked inference on full episodes."
+            "`episode` runs autoregressive chunked inference on full episodes. "
+            "`rollout` starts from a dataset slice, then keeps reusing the last "
+            "predicted frame as the next condition until `--total-frames` is reached."
         ),
     )
     parser.add_argument(
@@ -89,6 +91,18 @@ def parse_args():
         type=int,
         default=None,
         help="Optional override for the diffusion sampling step count.",
+    )
+    parser.add_argument(
+        "--total-frames",
+        type=int,
+        default=None,
+        help="Target output frame count for rollout inference.",
+    )
+    parser.add_argument(
+        "--rollout-conditioning-frames",
+        type=int,
+        default=1,
+        help="How many tail predicted frames are fed into the next rollout step.",
     )
     parser.add_argument(
         "--encode-chunk-size",
@@ -320,6 +334,19 @@ def pad_actions(actions, target_length):
     return torch.cat([actions, padding], dim=0)
 
 
+def pad_actions_with_last(actions, target_length, action_dim):
+    if actions.shape[0] >= target_length:
+        return actions[:target_length]
+
+    if actions.shape[0] == 0:
+        padding = torch.zeros(target_length, action_dim, dtype=torch.float32)
+        return padding
+
+    last_action = actions[-1:].clone()
+    padding = last_action.repeat(target_length - actions.shape[0], 1)
+    return torch.cat([actions, padding], dim=0)
+
+
 def encode_video(video, vae, device, chunk_size):
     video = video.to(device=device, dtype=torch.float32)
     batch_size, video_length = video.shape[:2]
@@ -404,6 +431,51 @@ def save_sample_prediction(sample_dir, sample_name, view_results, fps):
     write_video(sample_dir / "comparison.mp4", comparison_array, fps=fps)
 
     print(f"Saved {sample_name} to {sample_dir}")
+
+
+def save_rollout_prediction(sample_dir, sample_name, view_results, fps):
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    pred_columns = []
+    comparison_columns = []
+    metadata = {"sample_name": sample_name, "views": {}}
+    sorted_view_names = sorted(
+        view_results.keys(),
+        key=lambda name: int(view_results[name]["metadata"]["cam_id"])
+        if str(view_results[name]["metadata"]["cam_id"]).isdigit()
+        else str(view_results[name]["metadata"]["cam_id"]),
+    )
+    for view_name in sorted_view_names:
+        view_data = view_results[view_name]
+        pred_array = view_data["pred_array"]
+        pred_columns.append(pred_array)
+        metadata["views"][view_name] = view_data["metadata"]
+        np.save(sample_dir / f"{view_name}.pred.npy", pred_array)
+        write_video(sample_dir / f"{view_name}.pred.mp4", pred_array, fps=fps)
+
+        gt_array = view_data.get("gt_array")
+        if gt_array is not None and gt_array.shape[0] > 0:
+            gt_frames = min(gt_array.shape[0], pred_array.shape[0])
+            trimmed_gt = gt_array[:gt_frames]
+            trimmed_pred = pred_array[:gt_frames]
+            np.save(sample_dir / f"{view_name}.gt.npy", trimmed_gt)
+            comparison_columns.append(np.concatenate([trimmed_gt, trimmed_pred], axis=1))
+
+    pred_array = pred_columns[0]
+    if len(pred_columns) > 1:
+        pred_array = np.concatenate(pred_columns, axis=2)
+    write_video(sample_dir / "prediction.mp4", pred_array, fps=fps)
+
+    if comparison_columns:
+        comparison_array = comparison_columns[0]
+        if len(comparison_columns) > 1:
+            comparison_array = np.concatenate(comparison_columns, axis=2)
+        write_video(sample_dir / "comparison.mp4", comparison_array, fps=fps)
+
+    with open(sample_dir / "metadata.json", "w", encoding="utf-8") as file:
+        json.dump(metadata, file, indent=2)
+
+    print(f"Saved rollout {sample_name} to {sample_dir}")
 
 
 def run_slice_inference(
@@ -705,6 +777,224 @@ def run_episode_inference(
                 )
 
 
+def run_rollout_inference(
+    dataset,
+    pipeline,
+    vae,
+    device,
+    args,
+    cli_args,
+    checkpoint_path,
+    output_dir,
+    rank,
+    world_size,
+):
+    if cli_args.total_frames is None:
+        raise ValueError("`--total-frames` is required when inference_mode=rollout.")
+    if int(cli_args.total_frames) <= 0:
+        raise ValueError(f"`total_frames` must be > 0, got {cli_args.total_frames}.")
+    if int(args.num_frames) <= 1:
+        raise ValueError(f"`num_frames` must be > 1, got {args.num_frames}.")
+
+    initial_conditioning_frames = max(int(cli_args.conditioning_frames), 1)
+    initial_conditioning_frames = min(initial_conditioning_frames, int(args.num_frames) - 1)
+    rollout_conditioning_frames = max(int(cli_args.rollout_conditioning_frames), 1)
+    rollout_conditioning_frames = min(rollout_conditioning_frames, int(args.num_frames) - 1)
+
+    selected_indices = build_selected_indices(len(dataset), cli_args.start_index, cli_args.max_samples)
+    local_indices = shard_indices(selected_indices, rank, world_size)
+
+    if rank == 0:
+        print(
+            f"[Inference] mode=rollout total_slices={len(selected_indices)} "
+            f"dataset_size={len(dataset)} world_size={world_size} "
+            f"target_total_frames={cli_args.total_frames}"
+        )
+    print(f"[Inference] rank={rank} assigned_rollouts={len(local_indices)}")
+
+    progress = tqdm(
+        local_indices,
+        total=len(local_indices),
+        desc=f"Rollout Inference Rank {rank}",
+        position=rank,
+        leave=True,
+    )
+    with torch.no_grad():
+        for dataset_index in progress:
+            sample = dataset[dataset_index]
+            views = expand_views(sample)
+            if not views:
+                continue
+
+            sample_info = dataset.samples[dataset_index]
+            if "frame_interval" not in sample_info:
+                raise ValueError(
+                    "Rollout inference requires deterministic dataset slices with `frame_interval`."
+                )
+
+            frame_start = int(sample_info["frame_interval"][0])
+            ann = dataset.ann_dict[sample_info["ann_file"]]
+            episode_actions = load_episode_actions(dataset, ann)
+            rollout_actions = episode_actions[frame_start:]
+            rollout_actions = pad_actions_with_last(
+                rollout_actions,
+                max(int(cli_args.total_frames) - 1, 0),
+                dataset.action_dim,
+            )
+
+            sample_video_name = views[0]["video_name"]
+            _, base_sample_dir = build_sample_paths(output_dir, sample_video_name)
+            sample_dir = base_sample_dir / f"rollout_{int(cli_args.total_frames)}f"
+            sample_name = f"{sample_video_name['episode_id']}/{sample_dir.name}"
+            prediction_path = sample_dir / "prediction.mp4"
+            if prediction_path.exists() and not cli_args.overwrite:
+                print(f"Skip existing sample {sample_name}")
+                continue
+
+            view_results = {}
+            available_gt_frames = max(int(ann["num_frames"]) - frame_start, 0)
+            gt_frames_to_load = min(int(cli_args.total_frames), available_gt_frames)
+
+            for view in views:
+                video_name = view["video_name"]
+                gt_video = view["video"].unsqueeze(0)
+                current_initial_conditioning_frames = min(
+                    initial_conditioning_frames,
+                    gt_video.shape[1],
+                    int(cli_args.total_frames),
+                    available_gt_frames,
+                )
+
+                if current_initial_conditioning_frames <= 0:
+                    raise ValueError(
+                        f"Invalid conditioning frame count for sample {sample_name}: "
+                        f"{current_initial_conditioning_frames}."
+                    )
+
+                prefix_video = gt_video[:, :current_initial_conditioning_frames]
+                mask_x = encode_video(
+                    prefix_video,
+                    vae=vae,
+                    device=device,
+                    chunk_size=cli_args.encode_chunk_size,
+                )
+                pred_video_segments = []
+                generated_frames = 0
+                segment_index = 0
+                action_offset = 0
+                current_conditioning_frames = current_initial_conditioning_frames
+                segment_ranges = []
+
+                if int(cli_args.total_frames) <= current_initial_conditioning_frames:
+                    pred_video = prefix_video[:, :int(cli_args.total_frames)]
+                else:
+                    while generated_frames < int(cli_args.total_frames):
+                        action_slice = rollout_actions[action_offset:action_offset + int(args.num_frames) - 1]
+                        padded_actions = pad_actions_with_last(
+                            action_slice,
+                            int(args.num_frames) - 1,
+                            dataset.action_dim,
+                        )
+                        padded_actions = padded_actions.unsqueeze(0).to(device=device, dtype=torch.float32)
+
+                        pred_videos, pred_latents = pipeline(
+                            padded_actions,
+                            mask_x=mask_x,
+                            video_length=args.num_frames,
+                            height=args.video_size[0],
+                            width=args.video_size[1],
+                            num_inference_steps=args.infer_num_sampling_steps,
+                            guidance_scale=args.guidance_scale,
+                            device=device,
+                            return_dict=False,
+                            output_type="both",
+                            decode_chunk_size=cli_args.decode_chunk_size,
+                        )
+
+                        keep_start = 0 if segment_index == 0 else current_conditioning_frames
+                        available_chunk_frames = pred_videos.shape[1] - keep_start
+                        remaining_frames = int(cli_args.total_frames) - generated_frames
+                        keep_frames = min(available_chunk_frames, remaining_frames)
+                        keep_end = keep_start + keep_frames
+
+                        if keep_frames <= 0:
+                            break
+
+                        kept_pred_video = pred_videos[:, keep_start:keep_end]
+                        pred_video_segments.append(kept_pred_video)
+
+                        segment_ranges.append({
+                            "segment_index": int(segment_index),
+                            "action_offset": int(action_offset),
+                            "conditioning_frames": int(current_conditioning_frames),
+                            "kept_frames": int(keep_frames),
+                        })
+
+                        generated_frames += keep_frames
+                        if generated_frames >= int(cli_args.total_frames):
+                            break
+
+                        current_conditioning_frames = rollout_conditioning_frames
+                        mask_x = pred_latents[:, -current_conditioning_frames:].detach()
+                        action_offset += int(args.num_frames) - 1
+                        segment_index += 1
+
+                    pred_video = torch.cat(pred_video_segments, dim=1)
+                    pred_video = pred_video[:, :int(cli_args.total_frames)]
+
+                view_name = sanitize_name(video_name.get("cam_name", video_name["cam_id"]))
+                gt_array = None
+                if gt_frames_to_load > 0:
+                    gt_frames, _, _ = dataset._get_frames(
+                        ann,
+                        frame_start,
+                        frame_start + gt_frames_to_load,
+                        video_name.get("cam_name", video_name["cam_id"]),
+                    )
+                    gt_array = to_numpy_video(gt_frames.unsqueeze(0).float())
+
+                metadata = {
+                    "inference_mode": "rollout",
+                    "task_name": split_episode_id(video_name["episode_id"])[0],
+                    "episode_num": split_episode_id(video_name["episode_id"])[1],
+                    "sample_name": sample_name,
+                    "view_name": view_name,
+                    "dataset_index": int(dataset_index),
+                    "episode_id": video_name["episode_id"],
+                    "start_frame_id": video_name["start_frame_id"],
+                    "cam_id": video_name["cam_id"],
+                    "cam_name": video_name.get("cam_name", video_name["cam_id"]),
+                    "checkpoint": str(checkpoint_path),
+                    "config": cli_args.config,
+                    "mode": args.mode,
+                    "num_frames": int(args.num_frames),
+                    "initial_conditioning_frames": int(current_initial_conditioning_frames),
+                    "rollout_conditioning_frames": int(rollout_conditioning_frames),
+                    "num_inference_steps": int(args.infer_num_sampling_steps),
+                    "encode_chunk_size": int(cli_args.encode_chunk_size),
+                    "decode_chunk_size": int(cli_args.decode_chunk_size),
+                    "requested_total_frames": int(cli_args.total_frames),
+                    "available_gt_frames": int(available_gt_frames),
+                    "saved_pred_frames": int(pred_video.shape[1]),
+                    "segment_count": int(len(segment_ranges)),
+                    "segment_ranges": segment_ranges,
+                    "action_padding": "repeat_last",
+                }
+                view_results[view_name] = {
+                    "gt_array": gt_array,
+                    "pred_array": to_numpy_video(pred_video),
+                    "metadata": metadata,
+                }
+
+            if view_results:
+                save_rollout_prediction(
+                    sample_dir=sample_dir,
+                    sample_name=sample_name,
+                    view_results=view_results,
+                    fps=cli_args.fps,
+                )
+
+
 def main():
     cli_args = parse_args()
     args = load_config(cli_args.config)
@@ -757,6 +1047,19 @@ def main():
 
     if cli_args.inference_mode == "episode":
         run_episode_inference(
+            dataset=dataset,
+            pipeline=pipeline,
+            vae=vae,
+            device=device,
+            args=args,
+            cli_args=cli_args,
+            checkpoint_path=checkpoint_path,
+            output_dir=output_dir,
+            rank=rank,
+            world_size=world_size,
+        )
+    elif cli_args.inference_mode == "rollout":
+        run_rollout_inference(
             dataset=dataset,
             pipeline=pipeline,
             vae=vae,
