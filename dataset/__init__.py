@@ -31,7 +31,7 @@ def get_dataset(args):
             return Dataset_3D(args,mode='val'), Dataset_3D(args,mode='val')
         else:
             return Dataset_3D(args,mode='train'), Dataset_3D(args,mode='val')
-    elif args.dataset == 'libero':
+    elif args.dataset in {'libero', 'agibot'}:
         if args.do_evaluate:
             return None, Dataset_Libero(args, mode=args.mode)
         elif args.debug:

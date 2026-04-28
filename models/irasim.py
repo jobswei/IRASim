@@ -250,8 +250,8 @@ class IRASim(nn.Module):
                 self.embed_arm_state = torch.nn.Linear(self.state_dim, 4*hidden_size)
                 self.embed_state = torch.nn.Linear(4* hidden_size, hidden_size)
                 self.mask_emb_fn = nn.Embedding(num_embeddings=1, embedding_dim=hidden_size)
-            elif args.dataset in {'rt1', 'bridge', 'libero'}:
-                self.state_dim = 7
+            else:
+                self.state_dim = int(getattr(args, 'action_dim', 7))
                 approx_gelu = lambda: nn.GELU(approximate="tanh")
                 self.embed_state = Mlp(in_features=self.state_dim, hidden_features = hidden_size*4, out_features=hidden_size, act_layer=approx_gelu, drop=0)
                 self.mask_emb_fn = nn.Embedding(num_embeddings=1, embedding_dim=hidden_size)
@@ -264,7 +264,7 @@ class IRASim(nn.Module):
                 self.mlp = Mlp(in_features=(num_frames-1)*hidden_size , out_features=hidden_size, act_layer=approx_gelu, drop=0)
                 self.mask_emb_fn = nn.Embedding(num_embeddings=1, embedding_dim=hidden_size)
             else:
-                self.state_dim = 7
+                self.state_dim = int(getattr(args, 'action_dim', 7))
                 approx_gelu = lambda: nn.GELU(approximate="tanh")
                 self.embed_state = Mlp(in_features=(num_frames-1)*self.state_dim, hidden_features = hidden_size*4, out_features=hidden_size, act_layer=approx_gelu, drop=0)
                 self.mask_emb_fn = nn.Embedding(num_embeddings=1, embedding_dim=hidden_size)
@@ -367,7 +367,7 @@ class IRASim(nn.Module):
                 arm_state = actions
                 state_embeddings = self.embed_arm_state(arm_state) 
                 state_embeddings = self.embed_state(state_embeddings)
-            elif self.args.dataset in {'rt1', 'bridge', 'libero'}:
+            else:
                 state_embeddings = self.embed_state(actions)
 
             mask_emb = self.mask_emb_fn(torch.tensor(0, device=state_embeddings.device))

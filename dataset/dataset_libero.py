@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import random
 import traceback
 import warnings
 from pathlib import Path
 
+import imageio
 import numpy as np
 import torch
 from decord import VideoReader, cpu
@@ -32,9 +34,19 @@ class Dataset_Libero(Dataset):
         super().__init__()
         self.args = args
         self.mode = mode
+        self.dataset_name = str(getattr(args, 'dataset', 'libero'))
         self.sequence_length = int(args.num_frames)
         self.cam_ids = list(getattr(args, 'cam_ids', [0]))
-        self.use_all_views = bool(getattr(args, 'libero_use_all_views', False))
+        self.video_reader_backend = str(
+            getattr(args, 'video_reader_backend', self._get_default_video_reader_backend())
+        ).lower()
+        self.use_all_views = bool(
+            getattr(
+                args,
+                'use_all_views',
+                getattr(args, f'{self.dataset_name}_use_all_views', False),
+            )
+        )
         self.sample_interval = int(getattr(args, 'sample_interval', 10))
         self.sample_strategy = str(getattr(args, 'sample_strategy', 'uniform')).lower()
         if self.sample_strategy not in {'uniform', 'random'}:
@@ -42,22 +54,34 @@ class Dataset_Libero(Dataset):
 
         if getattr(args, 'pre_encode', False):
             raise NotImplementedError(
-                "Libero dataset does not provide latent videos. Set `pre_encode: False`."
+                f"{self.dataset_name} does not provide latent videos. Set `pre_encode: False`."
             )
 
-        self.action_dim = 7
+        self.action_dim = int(getattr(args, 'action_dim', self._get_default_action_dim()))
         self.c_act_scaler = np.array(
-            getattr(args, 'libero_c_act_scaler', [1.0] * self.action_dim),
+            getattr(
+                args,
+                'action_scaler',
+                getattr(args, f'{self.dataset_name}_c_act_scaler', [1.0] * self.action_dim),
+            ),
             dtype=float,
         )
+        if self.c_act_scaler.shape != (self.action_dim,):
+            raise ValueError(
+                f"`action_scaler` for {self.dataset_name} must have shape "
+                f"({self.action_dim},), got {self.c_act_scaler.shape}."
+            )
         self.dataset_log_first_n = int(getattr(args, 'dataset_log_first_n', 2))
         self.training = False
         self.wrong_number = 0
         self._logged_samples = 0
+        self._ffmpeg_fallback_warned_paths = set()
 
         self.data_root = self._resolve_data_root()
-        self.annotation_path = self._resolve_annotation_path(mode)
+        self.annotation_path, self.annotation_source = self._resolve_annotation_path(mode)
         self.annotations = self._load_annotations(self.annotation_path)
+        if self.annotation_path is None:
+            self.annotation_path = self.annotation_source
         self.ann_dict = {self._get_ann_id(ann): ann for ann in self.annotations}
         self.ann_files = list(self.ann_dict.keys())
         self.samples = self._init_sequences(self.annotations)
@@ -85,6 +109,19 @@ class Dataset_Libero(Dataset):
     def __str__(self):
         return f"{len(self.ann_files)} samples from {self.annotation_path}"
 
+    def _log_prefix(self, stage):
+        return f"[Dataset_{self.dataset_name.capitalize()}:{stage}]"
+
+    def _get_default_action_dim(self):
+        if self.dataset_name == 'agibot':
+            return 16
+        return 7
+
+    def _get_default_video_reader_backend(self):
+        if self.dataset_name == 'agibot':
+            return 'ffmpeg'
+        return 'auto'
+
     def _print_dataset_info(self):
         frame_counts = [int(ann['num_frames']) for ann in self.annotations]
         if frame_counts:
@@ -95,31 +132,33 @@ class Dataset_Libero(Dataset):
             min_frames = max_frames = avg_frames = 0
 
         print(
-            f"[Dataset_Libero:init] mode={self.mode} "
+            f"{self._log_prefix('init')} mode={self.mode} "
             f"data_root={self.data_root} annotation_path={self.annotation_path}"
         )
         print(
-            f"[Dataset_Libero:init] num_frames={self.sequence_length} "
+            f"{self._log_prefix('init')} num_frames={self.sequence_length} "
             f"mask_frame_num={getattr(self.args, 'mask_frame_num', 'N/A')} "
             f"sample_interval={self.sample_interval} "
             f"sequence_interval={getattr(self.args, 'sequence_interval', 'N/A')} "
             f"sample_strategy={self.sample_strategy}"
         )
         print(
-            f"[Dataset_Libero:init] cam_ids={self.cam_ids} "
+            f"{self._log_prefix('init')} cam_ids={self.cam_ids} "
             f"use_all_views={self.use_all_views} normalize={self.args.normalize} "
             f"pre_encode={getattr(self.args, 'pre_encode', False)} "
+            f"video_reader_backend={self.video_reader_backend} "
+            f"action_dim={self.action_dim} "
             f"dataset_log_first_n={self.dataset_log_first_n}"
         )
         print(
-            f"[Dataset_Libero:init] trajectories={len(self.ann_files)} "
+            f"{self._log_prefix('init')} trajectories={len(self.ann_files)} "
             f"samples={len(self.samples)} frame_stats(min/avg/max)="
             f"{min_frames}/{avg_frames:.1f}/{max_frames}"
         )
         if self.annotations:
             first_ann = self.annotations[0]
             print(
-                f"[Dataset_Libero:init] first_ann={self._get_ann_id(first_ann)} "
+                f"{self._log_prefix('init')} first_ann={self._get_ann_id(first_ann)} "
                 f"cameras={first_ann.get('camera_order', list(first_ann['videos'].keys()))} "
                 f"num_frames={first_ann['num_frames']} actions={first_ann['actions']}"
             )
@@ -144,61 +183,131 @@ class Dataset_Libero(Dataset):
 
         worker_id = worker_info.id if worker_info is not None else 'main'
         print(
-            f"[Dataset_Libero:getitem] worker={worker_id} mode={self.mode} "
+            f"{self._log_prefix('getitem')} worker={worker_id} mode={self.mode} "
             f"index={index} episode={self._get_ann_id(ann)} "
             f"frame_range=[{frame_start}, {frame_end}) total_frames={ann['num_frames']} "
             f"views={view_count} view_desc={view_desc}"
         )
         print(
-            f"[Dataset_Libero:getitem] video_shape={tuple(video.shape)} "
+            f"{self._log_prefix('getitem')} video_shape={tuple(video.shape)} "
             f"action_shape={tuple(action.shape)} video_name={video_name}"
         )
         self._logged_samples += 1
 
     def _resolve_data_root(self):
-        explicit_root = getattr(self.args, 'libero_data_root', None)
+        explicit_root = getattr(self.args, f'{self.dataset_name}_data_root', None)
         if explicit_root:
             root = Path(explicit_root)
             if root.exists():
                 return root
 
-        split = str(getattr(self.args, 'libero_split', '90'))
         base_dir = Path(getattr(self.args, 'base_dir', ''))
-        candidates = [
-            base_dir / 'work_dirs' / 'Datasets' / 'EWM_infer_meta' / 'libero' / split,
-        ]
+        candidates = []
+        if self.dataset_name == 'libero':
+            split = str(getattr(self.args, 'libero_split', '90'))
+            candidates.append(base_dir / 'work_dirs' / 'Datasets' / 'EWM_infer_meta' / 'libero' / split)
+        else:
+            candidates.append(base_dir / 'work_dirs' / 'Datasets' / 'EWM_infer_meta' / self.dataset_name)
 
         dataset_dir = getattr(self.args, 'dataset_dir', None)
         if dataset_dir:
-            candidates.append(Path(dataset_dir) / 'libero' / split)
+            if self.dataset_name == 'libero':
+                candidates.append(Path(dataset_dir) / 'libero' / split)
+            else:
+                candidates.append(Path(dataset_dir) / self.dataset_name)
 
         for candidate in candidates:
             if candidate.exists():
                 return candidate
 
         raise FileNotFoundError(
-            "Failed to locate Libero data root. "
-            "Set `libero_data_root` to a directory like "
-            "`work_dirs/Datasets/EWM_infer_meta/libero/90`."
+            f"Failed to locate {self.dataset_name} data root. "
+            f"Set `{self.dataset_name}_data_root` to a valid directory."
         )
 
     def _resolve_annotation_path(self, mode):
         if mode == 'train':
-            explicit_ann = getattr(self.args, 'libero_train_annotation', None)
-            default_ann = self.data_root / 'annotations_train.json'
+            mode_name = 'train'
         else:
-            explicit_ann = getattr(self.args, 'libero_eval_annotation', None)
-            default_ann = self.data_root / 'annotations_eval.json'
+            mode_name = 'eval'
 
-        ann_path = Path(explicit_ann) if explicit_ann else default_ann
-        if not ann_path.exists():
-            raise FileNotFoundError(f"Missing Libero annotation file: {ann_path}")
-        return ann_path
+        explicit_ann = getattr(self.args, f'{self.dataset_name}_{mode_name}_annotation', None)
+        candidates = []
+        if explicit_ann:
+            candidates.append(Path(explicit_ann))
+        candidates.append(self.data_root / f'annotations_{mode_name}.json')
+
+        for ann_path in candidates:
+            if ann_path.exists():
+                return ann_path, str(ann_path)
+
+        if self.dataset_name == 'agibot':
+            split_percent = int(getattr(self.args, 'agibot_split_percent', 90))
+            return None, f'auto-scan:{mode_name}:split={split_percent}'
+
+        raise FileNotFoundError(
+            f"Missing {self.dataset_name} annotation file. Checked: "
+            + ', '.join(str(path) for path in candidates)
+        )
 
     def _load_annotations(self, annotation_path):
+        if annotation_path is None:
+            return self._build_annotations_from_episode_files()
         with open(annotation_path, 'r') as file:
             annotations = json.load(file)
         return annotations
+
+    def _episode_sort_key(self, episode_name):
+        if str(episode_name).isdigit():
+            return (0, int(episode_name))
+        return (1, str(episode_name))
+
+    def _task_split_seed(self, task_name):
+        base_seed = int(getattr(self.args, 'agibot_split_seed', 3407))
+        digest = hashlib.md5(f'{task_name}:{base_seed}'.encode('utf-8')).hexdigest()
+        return int(digest[:8], 16)
+
+    def _build_annotations_from_episode_files(self):
+        annotation_paths = sorted(self.data_root.glob('*/*/annotation.json'))
+        if not annotation_paths:
+            raise FileNotFoundError(
+                f'No per-episode annotation.json files found under {self.data_root}.'
+            )
+
+        annotations_by_task = {}
+        for ann_path in annotation_paths:
+            with open(ann_path, 'r') as file:
+                ann = json.load(file)
+            task_name = ann_path.parent.parent.name
+            episode_name = ann_path.parent.name
+            annotations_by_task.setdefault(task_name, []).append((episode_name, ann))
+
+        split_percent = int(getattr(self.args, 'agibot_split_percent', 90))
+        if split_percent <= 0 or split_percent >= 100:
+            raise ValueError(f'`agibot_split_percent` must be in (0, 100), got {split_percent}.')
+
+        selected = []
+        for task_name, task_items in sorted(annotations_by_task.items()):
+            ordered_items = sorted(task_items, key=lambda item: self._episode_sort_key(item[0]))
+            task_rng = random.Random(self._task_split_seed(task_name))
+            task_rng.shuffle(ordered_items)
+
+            total_items = len(ordered_items)
+            eval_count = 1 if total_items > 1 else 0
+            eval_count = max(eval_count, int(round(total_items * (100 - split_percent) / 100.0)))
+            eval_count = min(eval_count, max(total_items - 1, 0))
+            train_count = total_items - eval_count
+
+            if self.mode == 'train':
+                chosen_items = ordered_items[:train_count]
+            else:
+                chosen_items = ordered_items[train_count:]
+                if not chosen_items and ordered_items:
+                    chosen_items = ordered_items[-1:]
+
+            selected.extend(ann for _, ann in chosen_items)
+
+        return selected
 
     def _get_ann_id(self, ann):
         action_path = Path(ann['actions'])
@@ -255,7 +364,37 @@ class Dataset_Libero(Dataset):
             cam_name = camera_order[cam_index]
         return cam_name, cam_index
 
+    def _load_video_ffmpeg(self, video_path, frame_ids, max_frames):
+        reader = imageio.get_reader(str(video_path), 'ffmpeg')
+        try:
+            usable_frames = min(reader.count_frames(), max_frames)
+            if usable_frames <= 0:
+                raise ValueError(f'No usable frames found in {video_path}')
+
+            capped_frame_ids = np.clip(np.asarray(frame_ids), 0, usable_frames - 1)
+            frame_data = [reader.get_data(int(frame_id)) for frame_id in capped_frame_ids.tolist()]
+            return np.stack(frame_data, axis=0)
+        finally:
+            reader.close()
+
     def _load_video(self, video_path, frame_ids, max_frames):
+        if self.video_reader_backend == 'ffmpeg':
+            return self._load_video_ffmpeg(video_path, frame_ids, max_frames)
+        if self.video_reader_backend == 'decord':
+            vr = VideoReader(str(video_path), ctx=cpu(0), num_threads=2)
+            usable_frames = min(len(vr), max_frames)
+            if usable_frames <= 0:
+                raise ValueError(f'No usable frames found in {video_path}')
+
+            capped_frame_ids = np.clip(np.asarray(frame_ids), 0, usable_frames - 1)
+            frame_data = vr.get_batch(capped_frame_ids.tolist()).asnumpy()
+            return frame_data
+        if self.video_reader_backend != 'auto':
+            raise ValueError(
+                f"Unsupported video_reader_backend={self.video_reader_backend}. "
+                "Expected one of: auto, decord, ffmpeg."
+            )
+
         vr = VideoReader(str(video_path), ctx=cpu(0), num_threads=2)
         usable_frames = min(len(vr), max_frames)
         if usable_frames <= 0:
@@ -269,7 +408,18 @@ class Dataset_Libero(Dataset):
         cam_name, cam_index = self._resolve_camera(ann, cam_id)
         video_path = self.data_root / ann['videos'][cam_name]
         frame_ids = list(range(frame_start, frame_end))
-        frames = self._load_video(video_path, frame_ids, max_frames=int(ann['num_frames']))
+        try:
+            frames = self._load_video(video_path, frame_ids, max_frames=int(ann['num_frames']))
+        except Exception as decord_error:
+            if self.video_reader_backend != 'auto':
+                raise
+            if str(video_path) not in self._ffmpeg_fallback_warned_paths:
+                warnings.warn(
+                    f"Failed to decode {video_path} with decord; "
+                    f"falling back to ffmpeg/imageio. Error: {decord_error}"
+                )
+                self._ffmpeg_fallback_warned_paths.add(str(video_path))
+            frames = self._load_video_ffmpeg(video_path, frame_ids, max_frames=int(ann['num_frames']))
         frames = frames.astype(np.uint8)
         frames = torch.from_numpy(frames).permute(0, 3, 1, 2)
 

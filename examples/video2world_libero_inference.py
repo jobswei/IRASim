@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 import imageio
@@ -12,18 +13,22 @@ from einops import rearrange
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from dataset.dataset_libero import Dataset_Libero
 from models import get_models
 from sample.pipeline_trajectory2videogen import Trajectory2VideoGenPipeline
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LIBERO checkpoint inference.")
+    parser = argparse.ArgumentParser(description="Checkpoint inference for Libero/Agibot-style datasets.")
     parser.add_argument(
         "--config",
         type=str,
         default="configs/train/libero/frame_ada.yaml",
-        help="Training config used to build the LIBERO model.",
+        help="Training config used to build the model and dataset.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -54,7 +59,13 @@ def parse_args():
         type=str,
         default="val",
         choices=["train", "val", "test"],
-        help="Dataset split mode used to build LIBERO inputs.",
+        help="Dataset split mode used to build inputs.",
+    )
+    parser.add_argument(
+        "--eval-annotation",
+        type=str,
+        default=None,
+        help="Optional override for the evaluation annotation json used when mode is val/test.",
     )
     parser.add_argument(
         "--start-index",
@@ -1017,8 +1028,10 @@ def run_rollout_inference(
 def main():
     cli_args = parse_args()
     args = load_config(cli_args.config)
-    if args.dataset != "libero":
-        raise ValueError(f"This script only supports dataset=libero, got {args.dataset}.")
+    if args.dataset not in {"libero", "agibot"}:
+        raise ValueError(
+            f"This script only supports dataset in {{'libero', 'agibot'}}, got {args.dataset}."
+        )
 
     args.mode = cli_args.mode
     if cli_args.sample_interval is not None:
@@ -1027,6 +1040,8 @@ def main():
         args.cam_ids = cli_args.cam_id
     if cli_args.num_inference_steps is not None:
         args.infer_num_sampling_steps = cli_args.num_inference_steps
+    if cli_args.eval_annotation is not None:
+        setattr(args, f"{args.dataset}_eval_annotation", cli_args.eval_annotation)
 
     rank, world_size, local_rank = resolve_runtime_context(cli_args)
     device = resolve_device(cli_args.device, local_rank)
@@ -1045,7 +1060,7 @@ def main():
     output_dir = (
         Path(cli_args.output_dir)
         if cli_args.output_dir is not None
-        else Path("work_dirs/inference/libero") / checkpoint_path.stem
+        else Path("work_dirs/inference") / args.dataset / checkpoint_path.stem
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -1,0 +1,51 @@
+dataset_dir: "work_dirs/Datasets/EWM_infer_meta"
+project_dir: "./"
+vae_model_path: "work_dirs/Checkpoints/stable-diffusion-xl-base-1.0"
+scheduler_path: "pretrained_models/scheduler"
+results_dir: "work_dirs/results"
+use_wandb: False
+dataset_log_first_n: 2
+
+dataset: "agibot"
+action_dim: 16
+agibot_split_percent: 90
+sequence_interval: 1
+sample_interval: 40
+sample_strategy: "uniform"
+video_reader_backend: "ffmpeg"
+cam_ids: ["head", "hand_left", "hand_right"]
+use_all_views: True
+accumulate_action: False
+pre_encode: False
+normalize: True
+mode: "val"
+
+anno: "agibot_frame_ada"
+debug: False
+do_evaluate: False
+final_frame_ada: False
+
+evaluate_checkpoint: False
+
+model: IRASim-XL/2
+num_frames: 17
+video_size: [192, 256]
+learn_sigma: False
+extras: 3
+mask_frame_num: 1
+
+learning_rate: 1e-4
+ckpt_every: 500
+clip_max_norm: 0.1
+start_clip_iter: 0
+local_batch_size: 1
+local_val_batch_size: 1
+max_train_steps: 300000
+global_seed: 3407
+num_workers: 8
+log_every: 10
+val_every: 10000
+gradient_accumulation_steps: 1
+attention_mode: "math"
+
+resume_from_checkpoint: False
